@@ -9,9 +9,9 @@ On first launch it signs you in with your own Microsoft account through the norm
 Proton and Python 3 are required. Clone this repository into the directory the DLL searches and run the installer:
 
 ```sh
-git clone git@github.com:Alextibtab/Dungeons2_linux_fix.git ~/.local/share/dungeons2-compat
+git clone https://github.com/Alextibtab/Dungeons2_linux_fix.git ~/.local/share/dungeons2-compat
 cd ~/.local/share/dungeons2-compat
-chmod +x install.sh xauth.py
+chmod +x install.sh
 ./install.sh
 ```
 
