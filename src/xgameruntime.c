@@ -5,7 +5,6 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <stdint.h>
-#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -112,7 +111,6 @@ typedef struct async_state {
     int cleaned;
     int completion_queued;
     void *payload;
-    char name[48];
 } async_state;
 
 static CRITICAL_SECTION g_lock;
@@ -120,93 +118,13 @@ static int g_lock_ready;
 static queue_obj *g_process_queue;
 static DWORD g_tls = TLS_OUT_OF_INDEXES;
 static int g_inited;
+static HINSTANCE g_module;
 
 static const char *PLS_PATH = "C:\\users\\steamuser\\AppData\\Local\\Dungeons2\\PLS";
-
-static void xlog(const char *fmt, ...)
-{
-    char buf[640];
-    va_list ap;
-    DWORD wrote;
-    HANDLE h;
-    int n;
-
-    va_start(ap, fmt);
-    n = vsnprintf(buf, sizeof(buf) - 2, fmt, ap);
-    va_end(ap);
-    if (n < 0) return;
-    if (n > (int)sizeof(buf) - 2) n = (int)sizeof(buf) - 2;
-    if (n == 0 || buf[n - 1] != '\n') buf[n++] = '\n';
-    buf[n] = 0;
-    h = CreateFileA("C:\\xgr.log", FILE_APPEND_DATA,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS,
-                    FILE_ATTRIBUTE_NORMAL, NULL);
-    if (h == INVALID_HANDLE_VALUE) return;
-    WriteFile(h, buf, (DWORD)n, &wrote, NULL);
-    CloseHandle(h);
-}
-
-static int sensitive_trace_enabled(void)
-{
-    static int enabled = -1;
-    const char *value;
-    if (enabled >= 0) return enabled;
-    value = getenv("XGR_TRACE_SENSITIVE");
-    enabled = value && !strcmp(value, "1");
-    return enabled;
-}
-
-static void xlog_sensitive(const char *fmt, ...)
-{
-    char buf[8192];
-    va_list ap;
-    DWORD wrote;
-    HANDLE h;
-    int n;
-    if (!sensitive_trace_enabled()) return;
-    va_start(ap, fmt);
-    n = vsnprintf(buf, sizeof(buf) - 2, fmt, ap);
-    va_end(ap);
-    if (n < 0) return;
-    if (n > (int)sizeof(buf) - 2) n = (int)sizeof(buf) - 2;
-    if (n == 0 || buf[n - 1] != '\n') buf[n++] = '\n';
-    buf[n] = 0;
-    h = CreateFileA("C:\\xgr-sensitive.log", FILE_APPEND_DATA,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS,
-                    FILE_ATTRIBUTE_NORMAL, NULL);
-    if (h == INVALID_HANDLE_VALUE) return;
-    WriteFile(h, buf, (DWORD)n, &wrote, NULL);
-    CloseHandle(h);
-}
-
-static const char *g_seen[160];
-static int g_seen_n;
-
-static void log_once(const char *s)
-{
-    int i;
-    if (!g_lock_ready) { xlog("%s", s); return; }
-    EnterCriticalSection(&g_lock);
-    for (i = 0; i < g_seen_n; i++) {
-        if (g_seen[i] == s) { LeaveCriticalSection(&g_lock); return; }
-    }
-    if (g_seen_n < (int)(sizeof(g_seen) / sizeof(g_seen[0])))
-        g_seen[g_seen_n++] = s;
-    LeaveCriticalSection(&g_lock);
-    xlog("%s", s);
-}
 
 static int guid_eq(const GUID *a, const GUID *b)
 {
     return memcmp(a, b, sizeof(GUID)) == 0;
-}
-
-static void log_guid(const char *tag, const GUID *g)
-{
-    xlog("%s %08lX-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X",
-         tag, g->Data1, g->Data2, g->Data3,
-         g->Data4[0], g->Data4[1], g->Data4[2], g->Data4[3],
-         g->Data4[4], g->Data4[5], g->Data4[6], g->Data4[7]);
 }
 
 #define G(name, d1, d2, d3, a, b, c, d, e, f, g, h) \
@@ -261,7 +179,6 @@ static ULONG WINAPI gen_release(com_obj *self) { (void)self; return 1; }
 static HRESULT WINAPI stub_notimpl(void *self)
 {
     (void)self;
-    log_once("stub_notimpl");
     return E_NOTIMPL_;
 }
 
@@ -551,7 +468,6 @@ static void complete_async(XAsyncBlock *block, HRESULT result, SIZE_T required)
     queue_obj *q;
     int mode;
     task_item *it;
-    static int logs;
 
     if (!st || st->cleaned) return;
     EnterCriticalSection(&g_lock);
@@ -560,7 +476,6 @@ static void complete_async(XAsyncBlock *block, HRESULT result, SIZE_T required)
     st->result = result;
     st->required = required;
     LeaveCriticalSection(&g_lock);
-    if (logs++ < 48) xlog("complete %s hr=%08lX", st->name, (unsigned long)result);
 
     if (!block->callback) return;
     q = block->queue ? block->queue : process_queue();
@@ -588,13 +503,11 @@ static HRESULT schedule_async(XAsyncBlock *block, UINT32 delay)
     queue_obj *q;
     int mode;
     task_item *it;
-    static int logs;
 
     if (!st || st->cleaned) return E_INVALIDARG_;
     if (st->complete) return S_OK;
     q = block->queue ? block->queue : process_queue();
     mode = mode_of(q, PORT_WORK);
-    if (logs++ < 48) xlog("schedule %s delay=%lu mode=%d", st->name, (unsigned long)delay, mode);
     if (mode == MODE_IMMEDIATE && delay == 0) {
         run_dowork(st);
         return S_OK;
@@ -636,10 +549,7 @@ static HRESULT WINAPI thr_GetStatus(void *self, XAsyncBlock *async, BOOLEAN wait
     async_state *st;
     HRESULT hr;
     unsigned spins = 0;
-    static unsigned calls;
     (void)self;
-    if ((++calls % 20000u) == 1u)
-        xlog("GetStatus calls=%u", calls);
     for (;;) {
         st = state_of(async);
         if (!st) {
@@ -657,9 +567,7 @@ static HRESULT WINAPI thr_GetStatus(void *self, XAsyncBlock *async, BOOLEAN wait
         }
         if (++spins > 4000) {
             st = state_of(async);
-            hr = (st && st->complete) ? st->result : E_PENDING_;
-            xlog("GetStatus giveup %s", st ? st->name : "?");
-            return hr;
+            return (st && st->complete) ? st->result : E_PENDING_;
         }
         Sleep(1);
     }
@@ -710,7 +618,6 @@ static HRESULT WINAPI thr_Run(void *self, XAsyncBlock *async, XAsyncWork work)
         st->block = async;
         st->context = (void *)work;
         st->provider = run_provider;
-        snprintf(st->name, sizeof(st->name), "XAsyncRun");
         state_bind(async, st);
         memset(&data, 0, sizeof(data));
         data.async = async;
@@ -727,7 +634,7 @@ static HRESULT WINAPI thr_Begin(void *self, XAsyncBlock *async, void *context, c
     async_state *st;
     XAsyncProviderData data;
     HRESULT hr;
-    (void)self;
+    (void)self; (void)identityName;
     if (!async || !provider) return E_INVALIDARG_;
     /* GDK requires a null queue to use the process-wide default. */
     if (!async->queue) {
@@ -742,15 +649,12 @@ static HRESULT WINAPI thr_Begin(void *self, XAsyncBlock *async, void *context, c
     st->context = context;
     st->identity = identity;
     st->provider = provider;
-    snprintf(st->name, sizeof(st->name), "%s", identityName ? identityName : "?");
     state_bind(async, st);
-    log_once(identityName ? identityName : "XAsyncBegin");
     memset(&data, 0, sizeof(data));
     data.async = async;
     data.context = context;
     hr = provider(OP_BEGIN, &data);
     if (FAILED(hr)) {
-        xlog("begin failed %s %08lX", st->name, (unsigned long)hr);
         cleanup_state(st);
         return hr;
     }
@@ -760,7 +664,6 @@ static HRESULT WINAPI thr_Begin(void *self, XAsyncBlock *async, void *context, c
 static HRESULT WINAPI thr_Pad(void *self)
 {
     (void)self;
-    log_once("threading padding");
     return E_NOTIMPL_;
 }
 
@@ -803,7 +706,6 @@ static HRESULT WINAPI thr_QueueCreate(void *self, UINT32 workMode, UINT32 compMo
     (void)self;
     if (!out) return E_POINTER_;
     *out = queue_new((int)workMode, (int)compMode);
-    xlog("QueueCreate %p work=%lu comp=%lu", (void *)*out, (unsigned long)workMode, (unsigned long)compMode);
     return *out ? S_OK : E_FAIL_;
 }
 
@@ -811,7 +713,6 @@ static HRESULT WINAPI thr_QueueCreateComposite(void *self, port_obj *work, port_
 {
     queue_obj *q;
     (void)self;
-    log_once("QueueCreateComposite");
     if (!out || !work || !comp || !work->q || !comp->q) return E_INVALIDARG_;
     q = calloc(1, sizeof(*q));
     if (!q) return E_FAIL_;
@@ -872,11 +773,6 @@ static BOOLEAN WINAPI thr_Dispatch(void *self, queue_obj *q, UINT32 port, UINT32
     }
     InterlockedIncrement(&q->refs);
     LeaveCriticalSection(&g_lock);
-    if (timeout != 0) {
-        static int disp_logs;
-        if (disp_logs++ < 12)
-            xlog("Dispatch q=%p port=%lu timeout=%lu", (void *)q, (unsigned long)port, (unsigned long)timeout);
-    }
     start = GetTickCount64();
     for (;;) {
         if (dispatch_one(q, (int)port)) { hit = TRUE; break; }
@@ -1005,7 +901,6 @@ static HRESULT WINAPI thr_SubmitDelayed(void *self, queue_obj *q, UINT32 port, U
 static HRESULT WINAPI thr_RegWaiter(void *self, queue_obj *q, UINT32 port, HANDLE h, void *ctx, XTaskQueueCallback cb, void *token)
 {
     (void)self; (void)q; (void)port; (void)h; (void)ctx; (void)cb; (void)token;
-    log_once("XTaskQueueRegisterWaiter");
     return E_NOTIMPL_;
 }
 static void WINAPI thr_UnregWaiter(void *self, queue_obj *q, UINT64 token)
@@ -1027,7 +922,6 @@ static HRESULT WINAPI thr_Terminate(void *self, queue_obj *q, BOOLEAN wait, void
     struct term_note *n;
     task_item *it;
     (void)self;
-    xlog("XTaskQueueTerminate q=%p wait=%u", (void *)q, (unsigned)wait);
     if (!q || !g_lock_ready) {
         if (cb) cb(ctx);
         return S_OK;
@@ -1073,14 +967,12 @@ static HRESULT WINAPI thr_Terminate(void *self, queue_obj *q, BOOLEAN wait, void
         if (tc && tc != tw && tc->comp_event) SetEvent(tc->comp_event);
     }
     thr_Close(NULL, q);
-    xlog("XTaskQueueTerminate done");
     return S_OK;
 }
 static HRESULT WINAPI thr_RegMon(void *self, queue_obj *q, void *ctx, void *cb, UINT64 *token)
 {
     static UINT64 next_token = 1;
     (void)self;
-    xlog("XTaskQueueRegisterMonitor q=%p", (void *)q);
     if (!q) q = process_queue();
     if (!g_lock_ready || !cb) return E_INVALIDARG_;
     EnterCriticalSection(&g_lock);
@@ -1122,7 +1014,6 @@ static BOOLEAN WINAPI thr_GetProcessQueue(void *self, queue_obj **out)
 static void WINAPI thr_SetProcessQueue(void *self, queue_obj *q)
 {
     (void)self;
-    log_once("SetProcessQueue");
     if (q) g_process_queue = q;
 }
 static HRESULT WINAPI thr_SetTimeSens(void *self, BOOLEAN on)
@@ -1164,7 +1055,6 @@ static HRESULT WINAPI threading_qi(com_obj *self, const GUID *iid, void **out)
 static BOOLEAN WINAPI feat_avail(void *self, UINT32 feature)
 {
     BOOLEAN yes;
-    static uint64_t logged;
     (void)self;
     /* XAsync, XAsyncProvider, XGame, XPersistentLocalStorage, XSystem, XTaskQueue, XThread, XUser, XError. */
     /* 2 XAsync, 3 XAsyncProvider, 5 XGame, 10 XNetworking, 12 PLS,
@@ -1172,10 +1062,6 @@ static BOOLEAN WINAPI feat_avail(void *self, UINT32 feature)
     yes = (feature == 2 || feature == 3 || feature == 5 || feature == 10 ||
            feature == 12 || feature == 15 || feature == 16 || feature == 17 ||
            feature == 18 || feature == 19);
-    if (feature < 64 && (logged & (1ull << feature)) == 0) {
-        logged |= 1ull << feature;
-        xlog("feature %lu -> %u", (unsigned long)feature, (unsigned)yes);
-    }
     return yes;
 }
 static void *feature_vtbl[] = { gen_qi, gen_addref, gen_release, feat_avail };
@@ -1191,18 +1077,15 @@ static HRESULT WINAPI game_title(void *self, UINT32 *titleId)
     (void)self;
     if (!titleId) return E_POINTER_;
     *titleId = TITLE_ID;
-    log_once("XGameGetXboxTitleId");
     return S_OK;
 }
 static void WINAPI game_launch(void *self, const char *exe, const char *args, void *user)
 {
-    (void)self; (void)user;
-    xlog("XLaunchNewGame %s %s", exe ? exe : "", args ? args : "");
+    (void)self; (void)user; (void)exe; (void)args;
 }
 static HRESULT WINAPI game_restart(void *self, const char *args, UINT32 reserved)
 {
-    (void)self; (void)reserved;
-    xlog("XLaunchRestartOnCrash %s", args ? args : "");
+    (void)self; (void)reserved; (void)args;
     return S_OK;
 }
 static void *game_vtbl[] = {
@@ -1226,25 +1109,21 @@ static HRESULT copy_out(const char *src, INT32 cap, char *dst, SIZE_T *used)
 static HRESULT WINAPI sys_console(void *self, INT32 cap, char *dst, SIZE_T *used)
 {
     (void)self;
-    log_once("XSystemGetConsoleId");
     return copy_out("0000000000000001", cap, dst, used);
 }
 static HRESULT WINAPI sys_sandbox(void *self, INT32 cap, char *dst, SIZE_T *used)
 {
     (void)self;
-    log_once("XSystemGetXboxLiveSandboxId");
     return copy_out("RETAIL", cap, dst, used);
 }
 static HRESULT WINAPI sys_device(void *self, INT32 cap, char *dst, SIZE_T *used)
 {
     (void)self;
-    log_once("XSystemGetAppSpecificDeviceId");
     return copy_out("d2d2d2d2-d2d2-4d2d-8d2d-d2d2d2d2d2d2", cap, dst, used);
 }
 static HRESULT WINAPI sys_track(void *self, void *cb, void *ctx)
 {
     (void)self; (void)cb; (void)ctx;
-    log_once("XSystemHandleTrack");
     return S_OK;
 }
 static BOOLEAN WINAPI sys_valid(void *self, void *handle)
@@ -1277,7 +1156,6 @@ typedef struct analytics_info {
 static analytics_info *WINAPI analytics_get(void *self, analytics_info *ret)
 {
     (void)self;
-    log_once("XSystemGetAnalyticsInfo");
     if (!ret) return NULL;
     memset(ret, 0, sizeof(*ret));
     ret->os_maj = 10;
@@ -1307,7 +1185,6 @@ static HRESULT WINAPI pls_path(void *self, SIZE_T pathSize, char *path, SIZE_T *
 {
     SIZE_T n = strlen(PLS_PATH) + 1;
     (void)self;
-    log_once("XPersistentLocalStorageGetPath");
     CreateDirectoryA("C:\\users\\steamuser\\AppData\\Local\\Dungeons2", NULL);
     CreateDirectoryA(PLS_PATH, NULL);
     if (used) *used = n;
@@ -1328,7 +1205,6 @@ static HRESULT WINAPI pls_space(void *self, UINT64 *info)
 static HRESULT WINAPI pls_prompt(void *self, UINT64 bytes, XAsyncBlock *async)
 {
     (void)self; (void)bytes;
-    log_once("PLS prompt");
     if (!async) return E_INVALIDARG_;
     complete_async(async, S_OK, 0);
     return S_OK;
@@ -1342,8 +1218,7 @@ static HRESULT WINAPI pls_prompt_result(void *self, XAsyncBlock *async)
 }
 static HRESULT WINAPI pls_mount(void *self, const char *pkg, void **mount)
 {
-    (void)self; (void)mount;
-    xlog("PLS mount %s", pkg ? pkg : "");
+    (void)self; (void)mount; (void)pkg;
     return E_NOTIMPL_;
 }
 static void *pls_vtbl[] = {
@@ -1366,12 +1241,10 @@ static void WINAPI err_setcb(void *self, void (__stdcall *cb)(HRESULT, const cha
     (void)self;
     g_err_cb = cb;
     g_err_ctx = ctx;
-    log_once("XErrorSetCallback");
 }
 static void WINAPI err_setopts(void *self, UINT32 a, UINT32 b)
 {
-    (void)self;
-    xlog("XErrorSetOptions %lu %lu", (unsigned long)a, (unsigned long)b);
+    (void)self; (void)a; (void)b;
 }
 static void *error_vtbl[] = { gen_qi, gen_addref, gen_release, err_pad, err_setcb, err_setopts };
 static com_obj error_obj = { error_vtbl };
@@ -1410,67 +1283,84 @@ static void auth_apply_line(char *line)
     else if (!strcmp(line, "msa")) snprintf(g_msa_token, sizeof g_msa_token, "%s", val);
 }
 
-static char g_compat_unix[360];
 static char g_token_z[420];
-static char g_code_z[420];
-static char g_err_z[420];
-static char g_auth_cmd[900];
+
+/* xauth.py writes tokens.txt next to itself. install.sh records that directory
+ * in xgameruntime.path beside each DLL copy, so the DLL does not assume a fixed
+ * install location. XGR_COMPAT_DIR overrides it. */
+static void token_z_from_dir(const char *dir)
+{
+    char wine[400];
+    size_t i, j = 0;
+    wine[j++] = 'Z';
+    wine[j++] = ':';
+    for (i = 0; dir[i] && j + 1 < sizeof wine; i++)
+        wine[j++] = (dir[i] == '/') ? '\\' : dir[i];
+    wine[j] = 0;
+    snprintf(g_token_z, sizeof g_token_z, "%s\\tokens.txt", wine);
+}
+
+static int token_dir_from_marker(char *out, size_t n)
+{
+    char path[1024];
+    DWORD len;
+    FILE *f;
+    if (!g_module) return 0;
+    len = GetModuleFileNameA(g_module, path, (DWORD)sizeof path);
+    if (len == 0 || len >= sizeof path) return 0;
+    while (len && path[len - 1] != '\\' && path[len - 1] != '/') len--;
+    if (len == 0 || (size_t)len + 18 >= sizeof path) return 0;
+    strcpy(path + len, "xgameruntime.path");
+    f = fopen(path, "r");
+    if (!f) return 0;
+    if (!fgets(out, (int)n, f)) { fclose(f); return 0; }
+    fclose(f);
+    len = (DWORD)strlen(out);
+    while (len && (out[len - 1] == '\n' || out[len - 1] == '\r' ||
+                   out[len - 1] == ' ' || out[len - 1] == '\t'))
+        out[--len] = 0;
+    return out[0] == '/';
+}
 
 static void compat_paths(void)
 {
-    const char *home = getenv("HOME");
-    const char *user;
-    char homebuf[240];
-    char wine[400];
-    size_t i, j;
-    if (g_auth_cmd[0]) return;
-    if (!home || home[0] != '/') {
-        user = getenv("USER");
-        if (!user || !user[0]) user = getenv("LOGNAME");
-        if (!user || !user[0]) {
-            xlog("HOME is unset; cannot find ~/.local/share/dungeons2-compat");
-            user = "steamuser";
-        }
-        snprintf(homebuf, sizeof homebuf, "/home/%s", user);
-        home = homebuf;
+    const char *env;
+    char dir[512];
+    if (g_token_z[0]) return;
+    env = getenv("XGR_COMPAT_DIR");
+    if (env && env[0] == '/') {
+        token_z_from_dir(env);
+        return;
     }
-    snprintf(g_compat_unix, sizeof g_compat_unix, "%s/.local/share/dungeons2-compat", home);
-    j = 0;
-    wine[j++] = 'Z';
-    wine[j++] = ':';
-    for (i = 0; g_compat_unix[i] && j + 1 < sizeof wine; i++)
-        wine[j++] = (g_compat_unix[i] == '/') ? '\\' : g_compat_unix[i];
-    wine[j] = 0;
-    snprintf(g_token_z, sizeof g_token_z, "%s\\tokens.txt", wine);
-    snprintf(g_code_z, sizeof g_code_z, "%s\\login-code.txt", wine);
-    snprintf(g_err_z, sizeof g_err_z, "%s\\login-error.txt", wine);
+    if (token_dir_from_marker(dir, sizeof dir)) {
+        token_z_from_dir(dir);
+        return;
+    }
+    /* Fallback for installs made before the marker existed. */
     {
-        /* Prefer the helper's virtual environment; fall back to system Python. */
-        char venv_win[420];
-        char python_unix[400];
-        snprintf(venv_win, sizeof venv_win, "%s\\.venv\\bin\\python3", wine);
-        if (GetFileAttributesA(venv_win) != INVALID_FILE_ATTRIBUTES)
-            snprintf(python_unix, sizeof python_unix, "%s/.venv/bin/python3", g_compat_unix);
-        else
-            snprintf(python_unix, sizeof python_unix, "/usr/bin/python3");
-        snprintf(g_auth_cmd, sizeof g_auth_cmd,
-                 "C:\\windows\\system32\\start.exe /unix %s %s/xauth.py",
-                 python_unix, g_compat_unix);
+        const char *home = getenv("HOME");
+        const char *user;
+        char homebuf[240];
+        char compat[360];
+        if (!home || home[0] != '/') {
+            user = getenv("USER");
+            if (!user || !user[0]) user = getenv("LOGNAME");
+            if (!user || !user[0]) user = "steamuser";
+            snprintf(homebuf, sizeof homebuf, "/home/%s", user);
+            home = homebuf;
+        }
+        snprintf(compat, sizeof compat, "%s/.local/share/dungeons2-compat", home);
+        token_z_from_dir(compat);
     }
 }
 
 static int auth_read_file(void)
 {
-    const char *paths[2];
     FILE *f = NULL;
     char line[16000];
-    int i;
     compat_paths();
-    paths[0] = "C:\\users\\steamuser\\AppData\\Local\\Dungeons2\\tokens.txt";
-    paths[1] = g_token_z;
-    for (i = 0; i < 2 && !f; i++) f = fopen(paths[i], "r");
+    f = fopen(g_token_z, "r");
     if (!f) {
-        log_once("auth file missing");
         return 0;
     }
     g_xbox_token[0] = g_mc_token[0] = g_playfab_token[0] = g_msa_token[0] = g_gamertag[0] = 0;
@@ -1483,71 +1373,7 @@ static int auth_read_file(void)
     }
     fclose(f);
     g_auth_loaded = g_xbox_token[0] && g_token_exp > (long long)time(NULL) + 30;
-    if (g_auth_loaded) log_once("auth file loaded");
-    else log_once("auth file unusable");
     return g_auth_loaded;
-}
-
-static DWORD WINAPI auth_prompt(void *unused)
-{
-    FILE *f;
-    char url[256], code[64], msg[400];
-    (void)unused;
-    compat_paths();
-    f = fopen(g_code_z, "r");
-    url[0] = code[0] = 0;
-    if (f) {
-        fgets(url, sizeof url, f);
-        fgets(code, sizeof code, f);
-        fclose(f);
-    }
-    snprintf(msg, sizeof msg, "Sign in with your Microsoft account.\n\n%s\nCode: %s", url, code);
-    xlog("microsoft login code %s", code);
-    MessageBoxA(NULL, msg, "Minecraft Dungeons II sign-in", MB_OK | MB_SETFOREGROUND);
-    return 0;
-}
-
-static int auth_ensure(void)
-{
-    STARTUPINFOA si;
-    PROCESS_INFORMATION pi;
-    int i, prompted = 0;
-    compat_paths();
-    if (auth_read_file()) return 1;
-    DeleteFileA(g_err_z);
-    DeleteFileA(g_code_z);
-    memset(&si, 0, sizeof si);
-    si.cb = sizeof si;
-    memset(&pi, 0, sizeof pi);
-    xlog("starting Microsoft sign-in");
-    if (!CreateProcessA(NULL, g_auth_cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
-        xlog("login spawn failed %lu", (unsigned long)GetLastError());
-        return 0;
-    }
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
-    for (i = 0; i < 240; i++) {
-        FILE *err;
-        if (auth_read_file()) {
-            xlog("microsoft sign-in ok xuid=%llu", g_xuid);
-            return 1;
-        }
-        err = fopen(g_err_z, "r");
-        if (err) {
-            char buf[300];
-            if (!fgets(buf, sizeof buf, err)) buf[0] = 0;
-            fclose(err);
-            xlog("microsoft sign-in failed %s", buf);
-            return 0;
-        }
-        if (!prompted && GetFileAttributesA(g_code_z) != INVALID_FILE_ATTRIBUTES) {
-            prompted = 1;
-            CreateThread(NULL, 0, auth_prompt, NULL, 0, NULL);
-        }
-        Sleep(1000);
-    }
-    xlog("microsoft sign-in timed out");
-    return 0;
 }
 
 static const char *auth_token_for(const char *url)
@@ -1598,8 +1424,7 @@ static HRESULT WINAPI user_add_async(void *self, UINT32 options, XAsyncBlock *as
     async_state *st;
     XAsyncProviderData data;
     HRESULT hr;
-    (void)self;
-    xlog("XUserAddAsync opts=%lu", (unsigned long)options);
+    (void)self; (void)options;
     if (!async) return E_INVALIDARG_;
     st = calloc(1, sizeof(*st));
     if (!st) return E_FAIL_;
@@ -1607,7 +1432,6 @@ static HRESULT WINAPI user_add_async(void *self, UINT32 options, XAsyncBlock *as
     st->block = async;
     st->provider = user_add_provider;
     st->payload = &user_obj;
-    snprintf(st->name, sizeof(st->name), "XUserAdd");
     state_bind(async, st);
     memset(&data, 0, sizeof(data));
     data.async = async;
@@ -1624,7 +1448,6 @@ static HRESULT WINAPI user_add_result(void *self, XAsyncBlock *async, void **new
     if (!st->complete) return E_PENDING_;
     if (FAILED(st->result)) return st->result;
     *newUser = &user_obj;
-    log_once("XUserAddResult");
     return S_OK;
 }
 static HRESULT WINAPI user_local_id(void *self, void *user, UINT64 *id)
@@ -1645,11 +1468,9 @@ static HRESULT WINAPI user_find_local(void *self, UINT64 id, void **handle)
 static HRESULT WINAPI user_get_id(void *self, void *user, UINT64 *id)
 {
     (void)self; (void)user;
-    log_once("XUserGetId");
     if (!id) return E_POINTER_;
     auth_read_file();
     *id = g_xuid ? g_xuid : 1;
-    xlog("XUserGetId value %llu", (unsigned long long)*id);
     return S_OK;
 }
 static HRESULT WINAPI user_find_id(void *self, UINT64 id, void **handle)
@@ -1657,10 +1478,7 @@ static HRESULT WINAPI user_find_id(void *self, UINT64 id, void **handle)
     (void)self;
     if (!handle) return E_POINTER_;
     auth_read_file();
-    if (id != 1 && id != g_xuid) {
-        xlog("XUserFindUserById miss %llu", (unsigned long long)id);
-        return E_FAIL_;
-    }
+    if (id != 1 && id != g_xuid) return E_FAIL_;
     *handle = &user_obj;
     return S_OK;
 }
@@ -1674,7 +1492,6 @@ static HRESULT WINAPI user_guest(void *self, void *user, BOOLEAN *guest)
 static HRESULT WINAPI user_state(void *self, void *user, UINT32 *state)
 {
     (void)self; (void)user;
-    log_once("XUserGetState");
     if (!state) return E_POINTER_;
     *state = 0; /* SignedIn */
     return S_OK;
@@ -1682,7 +1499,6 @@ static HRESULT WINAPI user_state(void *self, void *user, UINT32 *state)
 static HRESULT WINAPI user_pic_async(void *self, void *user, UINT32 size, XAsyncBlock *async)
 {
     (void)self; (void)user; (void)size; (void)async;
-    log_once("XUserGetGamerPictureAsync");
     return E_NOTIMPL_;
 }
 static HRESULT WINAPI user_pic_size(void *self, XAsyncBlock *async, SIZE_T *sz)
@@ -1704,12 +1520,7 @@ static HRESULT WINAPI user_age(void *self, void *user, UINT32 *age)
 }
 static HRESULT WINAPI user_priv(void *self, void *user, UINT32 opts, UINT32 priv, BOOLEAN *has, UINT32 *reason)
 {
-    static uint64_t seen[4];
-    (void)self; (void)user; (void)opts;
-    if ((priv >> 6) < 4 && (seen[priv >> 6] & (1ull << (priv & 63))) == 0) {
-        seen[priv >> 6] |= 1ull << (priv & 63);
-        xlog("privilege %lu", (unsigned long)priv);
-    }
+    (void)self; (void)user; (void)opts; (void)priv;
     if (has) *has = TRUE;
     if (reason) *reason = 0;
     return S_OK;
@@ -1717,7 +1528,6 @@ static HRESULT WINAPI user_priv(void *self, void *user, UINT32 opts, UINT32 priv
 static HRESULT WINAPI user_resolve_priv_async(void *self, void *user, UINT32 opts, UINT32 priv, XAsyncBlock *async)
 {
     (void)self; (void)user; (void)opts; (void)priv; (void)async;
-    log_once("XUserResolvePrivilegeWithUiAsync");
     return E_NOTIMPL_;
 }
 static HRESULT WINAPI user_resolve_priv_result(void *self, XAsyncBlock *async)
@@ -1759,7 +1569,7 @@ static HRESULT WINAPI token_provider(UINT32 op, const XAsyncProviderData *data)
     if (op != OP_DOWORK) return S_OK;
     st = state_of(data->async);
     url = st ? (const char *)st->context : NULL;
-    if (!auth_ensure()) {
+    if (!auth_read_file()) {
         complete_async(data->async, E_FAIL_, 0);
         return S_OK;
     }
@@ -1769,7 +1579,7 @@ static HRESULT WINAPI token_provider(UINT32 op, const XAsyncProviderData *data)
     return S_OK;
 }
 
-static HRESULT start_token_async(XAsyncBlock *async, const char *url, const char *name)
+static HRESULT start_token_async(XAsyncBlock *async, const char *url)
 {
     async_state *st;
     XAsyncProviderData data;
@@ -1781,7 +1591,6 @@ static HRESULT start_token_async(XAsyncBlock *async, const char *url, const char
     st->block = async;
     st->context = (url && url[0]) ? strdup(url) : NULL;
     st->provider = token_provider;
-    snprintf(st->name, sizeof st->name, "%s", name);
     state_bind(async, st);
     memset(&data, 0, sizeof data);
     data.async = async;
@@ -1794,9 +1603,8 @@ static HRESULT start_token_async(XAsyncBlock *async, const char *url, const char
 static HRESULT WINAPI user_token_async(void *self, void *user, UINT32 opts, const char *method, const char *url,
                                        SIZE_T headerCount, const void *headers, SIZE_T bodySize, const void *body, XAsyncBlock *async)
 {
-    (void)self; (void)user; (void)opts; (void)headerCount; (void)headers; (void)bodySize; (void)body;
-    xlog("token %s %s", method ? method : "?", url ? url : "");
-    return start_token_async(async, url, "XUserToken");
+    (void)self; (void)user; (void)opts; (void)headerCount; (void)headers; (void)bodySize; (void)body; (void)method;
+    return start_token_async(async, url);
 }
 static HRESULT WINAPI user_token_size(void *self, XAsyncBlock *async, SIZE_T *sz)
 {
@@ -1840,13 +1648,11 @@ static HRESULT WINAPI user_token16_async(void *self, void *user, UINT32 opts, co
     (void)self; (void)user; (void)opts; (void)method; (void)headerCount; (void)headers; (void)bodySize; (void)body;
     url8[0] = 0;
     if (url) WideCharToMultiByte(CP_UTF8, 0, url, -1, url8, sizeof url8, NULL, NULL);
-    xlog("token utf16 %s", url8);
-    return start_token_async(async, url8[0] ? url8 : NULL, "XUserToken16");
+    return start_token_async(async, url8[0] ? url8 : NULL);
 }
 static HRESULT WINAPI user_issue_async(void *self, void *user, const char *url, XAsyncBlock *async)
 {
-    (void)self; (void)user; (void)async;
-    xlog("resolve issue %s", url ? url : "");
+    (void)self; (void)user; (void)async; (void)url;
     return E_NOTIMPL_;
 }
 static HRESULT WINAPI user_issue_result(void *self, XAsyncBlock *async)
@@ -1857,7 +1663,6 @@ static HRESULT WINAPI user_issue_result(void *self, XAsyncBlock *async)
 static HRESULT WINAPI user_issue16_async(void *self, void *user, const WCHAR *url, XAsyncBlock *async)
 {
     (void)self; (void)user; (void)url; (void)async;
-    log_once("resolve issue utf16");
     return E_NOTIMPL_;
 }
 typedef void (__stdcall *user_change_fn)(void *context, UINT64 localId, UINT32 event);
@@ -1866,7 +1671,6 @@ static void *g_change_ctx;
 static void __stdcall deliver_user_change(void *ctx, BOOLEAN canceled)
 {
     (void)ctx; (void)canceled;
-    xlog("deliver user change");
     if (g_change_cb) g_change_cb(g_change_ctx, 1, 0);
 }
 static HRESULT WINAPI user_reg_change(void *self, void *q, void *ctx, void *cb, UINT64 *token)
@@ -1874,7 +1678,6 @@ static HRESULT WINAPI user_reg_change(void *self, void *q, void *ctx, void *cb, 
     (void)self;
     g_change_cb = (user_change_fn)cb;
     g_change_ctx = ctx;
-    xlog("XUserRegisterForChangeEvent q=%p", q);
     if (token) *token = 1;
     if (cb) thr_Submit(NULL, (queue_obj *)q, PORT_COMP, NULL, deliver_user_change);
     return S_OK;
@@ -1894,7 +1697,7 @@ static HRESULT WINAPI user_deferral(void *self, void **out)
 static void WINAPI user_close_deferral(void *self, void *d) { (void)self; (void)d; }
 static HRESULT WINAPI user_add_by_id(void *self, UINT64 id, XAsyncBlock *async)
 {
-    xlog("XUserAddByIdWithUiAsync id=%llu", (unsigned long long)id);
+    (void)id;
     return user_add_async(self, 0, async);
 }
 static HRESULT WINAPI user_add_by_id_result(void *self, XAsyncBlock *async, void **user)
@@ -1913,7 +1716,7 @@ static HRESULT WINAPI msa_provider(UINT32 op, const XAsyncProviderData *data)
     }
     if (op != OP_DOWORK) return S_OK;
     st = state_of(data->async);
-    if (!auth_ensure()) {
+    if (!auth_read_file()) {
         complete_async(data->async, E_FAIL_, 0);
         return S_OK;
     }
@@ -1926,15 +1729,13 @@ static HRESULT WINAPI user_msa_async(void *self, void *user, UINT32 opts, const 
     async_state *st;
     XAsyncProviderData data;
     HRESULT hr;
-    (void)self; (void)user; (void)opts;
-    xlog("msa token %s", scope ? scope : "");
+    (void)self; (void)user; (void)opts; (void)scope;
     if (!async) return E_INVALIDARG_;
     st = calloc(1, sizeof(*st));
     if (!st) return E_FAIL_;
     st->magic = ASYNC_MAGIC;
     st->block = async;
     st->provider = msa_provider;
-    snprintf(st->name, sizeof st->name, "XUserMsa");
     state_bind(async, st);
     memset(&data, 0, sizeof data);
     data.async = async;
@@ -1970,13 +1771,11 @@ static HRESULT WINAPI user_msa_size(void *self, XAsyncBlock *async, SIZE_T *sz)
 static BOOLEAN WINAPI user_is_store(void *self, void *user)
 {
     (void)self; (void)user;
-    log_once("XUserIsStoreUser");
     return FALSE;
 }
 static HRESULT WINAPI user_remote_set(void *self, void *q, void *handlers)
 {
     (void)self; (void)q; (void)handlers;
-    log_once("remote connect handlers");
     return S_OK;
 }
 static HRESULT WINAPI user_remote_cancel(void *self, void *op)
@@ -1987,7 +1786,6 @@ static HRESULT WINAPI user_remote_cancel(void *self, void *op)
 static HRESULT WINAPI user_spop_set(void *self, void *q, void *handler, void *ctx)
 {
     (void)self; (void)q; (void)handler; (void)ctx;
-    log_once("spop handlers");
     return S_OK;
 }
 static HRESULT WINAPI user_spop_complete(void *self, void *op, UINT32 result)
@@ -2003,7 +1801,6 @@ static BOOLEAN WINAPI user_signout_present(void *self)
 static HRESULT WINAPI user_signout_async(void *self, void *user, XAsyncBlock *async)
 {
     (void)self; (void)user; (void)async;
-    log_once("XUserSignOutAsync");
     return E_NOTIMPL_;
 }
 static HRESULT WINAPI user_signout_result(void *self, XAsyncBlock *async)
@@ -2044,7 +1841,6 @@ static HRESULT WINAPI tag_get(void *self, void *user, UINT32 component, SIZE_T c
     const char *s = gamertag_for(component);
     SIZE_T n = strlen(s) + 1;
     (void)self; (void)user;
-    xlog("gamertag component %lu", (unsigned long)component);
     if (used) *used = n;
     if (!buf || cap < n) return E_INSUFFICIENT_;
     memcpy(buf, s, n);
@@ -2065,7 +1861,6 @@ static HRESULT WINAPI gamertag_qi(com_obj *self, const GUID *iid, void **out)
 static HRESULT WINAPI proto_reg(void *self, void *queue, void *context, void *callback, UINT64 *token)
 {
     (void)self; (void)queue; (void)context; (void)callback;
-    log_once("XGameProtocolRegisterForActivation");
     if (token) *token = 1;
     return S_OK;
 }
@@ -2077,7 +1872,6 @@ static BOOLEAN WINAPI proto_unreg(void *self, UINT64 token, BOOLEAN wait)
 static HRESULT WINAPI net_port(void *self, UINT16 *port)
 {
     (void)self;
-    log_once("XNetworkingQueryPreferredLocalUdpMultiplayerPort");
     if (!port) return E_POINTER_;
     *port = 3074;
     return S_OK;
@@ -2085,7 +1879,6 @@ static HRESULT WINAPI net_port(void *self, UINT16 *port)
 static HRESULT WINAPI net_port_async(void *self, XAsyncBlock *async)
 {
     (void)self; (void)async;
-    log_once("udp port async");
     return E_NOTIMPL_;
 }
 static HRESULT WINAPI net_port_result(void *self, XAsyncBlock *async, UINT16 *port)
@@ -2098,7 +1891,6 @@ static HRESULT WINAPI net_port_result(void *self, XAsyncBlock *async, UINT16 *po
 static HRESULT WINAPI net_reg_port(void *self, void *q, void *ctx, void *cb, UINT64 *token)
 {
     (void)self; (void)q; (void)ctx; (void)cb;
-    log_once("reg udp port");
     if (token) *token = 1;
     return S_OK;
 }
@@ -2126,139 +1918,8 @@ static void *(WINAPI *real_connect)(void *, const WCHAR *, unsigned short, DWORD
 static void *(WINAPI *real_open_request)(void *, const WCHAR *, const WCHAR *, const WCHAR *, const WCHAR *, const WCHAR **, DWORD);
 static BOOL (WINAPI *real_add_headers)(void *, const WCHAR *, DWORD, DWORD);
 static BOOL (WINAPI *real_send)(void *, const WCHAR *, DWORD, void *, DWORD, DWORD, DWORD_PTR);
-static BOOL (WINAPI *real_data_available)(void *, DWORD *);
 static BOOL (WINAPI *real_recv)(void *, void *);
-static BOOL (WINAPI *real_query)(void *, DWORD, const WCHAR *, void *, DWORD *, DWORD *);
 static BOOL (WINAPI *real_read)(void *, void *, DWORD, DWORD *);
-
-static void *http_handles[24];
-static int http_codes[24];
-static int http_next;
-
-/* Log request shape only. Header values can contain credentials, so never log them. */
-static int http_has_header(const WCHAR *headers, DWORD length, const WCHAR *name)
-{
-    DWORD used, start, i = 0;
-    SIZE_T name_len;
-    if (!headers) return 0;
-    used = length == (DWORD)-1 ? lstrlenW(headers) : length;
-    name_len = lstrlenW(name);
-    while (i < used) {
-        while (i < used && (headers[i] == '\r' || headers[i] == '\n')) i++;
-        start = i;
-        while (i < used && headers[i] != ':' && headers[i] != '\r' && headers[i] != '\n') i++;
-        if (i < used && headers[i] == ':' && i - start == name_len &&
-            CompareStringOrdinal(headers + start, (int)name_len, name, (int)name_len, TRUE) == CSTR_EQUAL)
-            return 1;
-        while (i < used && headers[i] != '\n') i++;
-    }
-    return 0;
-}
-
-static void log_header_shape(const char *source, const WCHAR *headers, DWORD length, DWORD body_length)
-{
-    if (!headers) return;
-    xlog("http %s auth=%d signature=%d xbl_contract=%d content_type=%d cookie=%d body=%lu",
-         source,
-         http_has_header(headers, length, L"Authorization"),
-         http_has_header(headers, length, L"Signature"),
-         http_has_header(headers, length, L"X-Xbl-Contract-Version"),
-         http_has_header(headers, length, L"Content-Type"),
-         http_has_header(headers, length, L"Cookie"),
-         (unsigned long)body_length);
-}
-
-static void log_sensitive_headers(void *request, const WCHAR *headers, DWORD length)
-{
-    char buffer[7168];
-    DWORD chars;
-    int bytes;
-    if (!sensitive_trace_enabled() || !headers) return;
-    chars = length == (DWORD)-1 ? (DWORD)lstrlenW(headers) : length;
-    if (chars > 3500) chars = 3500;
-    bytes = WideCharToMultiByte(CP_UTF8, 0, headers, (int)chars, buffer, sizeof(buffer) - 1, NULL, NULL);
-    if (bytes <= 0) return;
-    buffer[bytes] = 0;
-    xlog_sensitive("headers handle=%p chars=%lu\n%s", request, (unsigned long)length, buffer);
-}
-
-static void dump_sensitive_body(void *request, const void *body, DWORD length)
-{
-    static LONG next_body;
-    char name[64];
-    DWORD wrote;
-    HANDLE h;
-    LONG index;
-    if (!sensitive_trace_enabled() || !body || !length) return;
-    index = InterlockedIncrement(&next_body);
-    snprintf(name, sizeof(name), "C:\\xgr-body-%ld.bin", (long)index);
-    h = CreateFileA(name, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (h == INVALID_HANDLE_VALUE) return;
-    WriteFile(h, body, length, &wrote, NULL);
-    CloseHandle(h);
-    xlog_sensitive("body handle=%p file=%s length=%lu written=%lu", request, name,
-                   (unsigned long)length, (unsigned long)wrote);
-}
-
-static void dump_sensitive_response_chunk(void *request, const void *body, DWORD length)
-{
-    static LONG next_chunk;
-    char name[64];
-    DWORD wrote;
-    HANDLE h;
-    LONG index;
-    if (!sensitive_trace_enabled() || !body || !length) return;
-    index = InterlockedIncrement(&next_chunk);
-    snprintf(name, sizeof(name), "C:\\xgr-response-%ld.bin", (long)index);
-    h = CreateFileA(name, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (h == INVALID_HANDLE_VALUE) return;
-    WriteFile(h, body, length, &wrote, NULL);
-    CloseHandle(h);
-    xlog_sensitive("response body handle=%p file=%s length=%lu written=%lu", request, name,
-                   (unsigned long)length, (unsigned long)wrote);
-}
-
-static void capture_sensitive_error_response(void *request)
-{
-    DWORD available = 0, read = 0, cap;
-    void *buffer;
-    if (!sensitive_trace_enabled() || !real_data_available || !real_read) return;
-    if (!real_data_available(request, &available) || !available) return;
-    cap = available > 65536 ? 65536 : available;
-    buffer = malloc(cap);
-    if (!buffer) return;
-    if (real_read(request, buffer, cap, &read) && read)
-        dump_sensitive_response_chunk(request, buffer, read);
-    free(buffer);
-}
-
-static void log_sensitive_response_headers(void *request)
-{
-    WCHAR headers[4096];
-    char buffer[7168];
-    DWORD length = sizeof(headers);
-    int bytes;
-    if (!sensitive_trace_enabled() || !real_query) return;
-    if (!real_query(request, 22, NULL, headers, &length, NULL)) return;
-    bytes = WideCharToMultiByte(CP_UTF8, 0, headers, -1, buffer, sizeof(buffer) - 1, NULL, NULL);
-    if (bytes <= 0) return;
-    buffer[bytes] = 0;
-    xlog_sensitive("response headers handle=%p bytes=%lu\n%s", request, (unsigned long)length, buffer);
-}
-static int http_status_of(void *req)
-{
-    int i;
-    for (i = 0; i < 24; i++) if (http_handles[i] == req) return http_codes[i];
-    return 0;
-}
-static void http_status_set(void *req, int code)
-{
-    int i;
-    for (i = 0; i < 24; i++) if (http_handles[i] == req) { http_codes[i] = code; return; }
-    http_handles[http_next % 24] = req;
-    http_codes[http_next % 24] = code;
-    http_next++;
-}
 
 static BOOL WINAPI hook_set_option(void *handle, DWORD option, void *buffer, DWORD length)
 {
@@ -2275,111 +1936,86 @@ static BOOL WINAPI hook_set_option(void *handle, DWORD option, void *buffer, DWO
 }
 static void *WINAPI hook_connect(void *session, const WCHAR *host, unsigned short port, DWORD reserved)
 {
-    char host8[200];
-    host8[0] = 0;
-    if (host) WideCharToMultiByte(CP_UTF8, 0, host, -1, host8, sizeof host8, NULL, NULL);
-    if (!strstr(host8, "events.data.microsoft.com"))
-        xlog("http connect %s:%u", host8, (unsigned)port);
     return real_connect(session, host, port, reserved);
 }
 static void *WINAPI hook_open_request(void *connect, const WCHAR *verb, const WCHAR *object, const WCHAR *version,
                                       const WCHAR *referrer, const WCHAR **accept, DWORD flags)
 {
-    char path[240], method[32];
-    void *request;
-    static int logged;
-    path[0] = 0;
-    method[0] = 0;
-    if (verb) WideCharToMultiByte(CP_UTF8, 0, verb, -1, method, sizeof method, NULL, NULL);
-    if (object) WideCharToMultiByte(CP_UTF8, 0, object, -1, path, sizeof path, NULL, NULL);
-    if (logged < 40 && path[0] && !strstr(path, "OneCollector")) {
-        logged++;
-        xlog("http %s %s", method, path);
-    }
-    request = real_open_request(connect, verb, object, version, referrer, accept, flags);
-    xlog_sensitive("open handle=%p method=%s path=%s", request, method, path);
-    return request;
+    return real_open_request(connect, verb, object, version, referrer, accept, flags);
 }
 static BOOL WINAPI hook_add_headers(void *request, const WCHAR *headers, DWORD headers_len, DWORD modifiers)
 {
-    log_header_shape("add_headers", headers, headers_len, 0);
-    log_sensitive_headers(request, headers, headers_len);
     return real_add_headers(request, headers, headers_len, modifiers);
 }
 static BOOL WINAPI hook_send(void *request, const WCHAR *headers, DWORD headers_len, void *optional, DWORD optional_len, DWORD total, DWORD_PTR ctx)
 {
-    log_header_shape("send", headers, headers_len, optional_len);
-    log_sensitive_headers(request, headers, headers_len);
-    dump_sensitive_body(request, optional, optional_len);
-    BOOL ok = real_send(request, headers, headers_len, optional, optional_len, total, ctx);
-    if (!ok) xlog("http send failed %lu", (unsigned long)GetLastError());
-    return ok;
+    return real_send(request, headers, headers_len, optional, optional_len, total, ctx);
 }
 static BOOL WINAPI hook_recv(void *request, void *reserved)
 {
-    BOOL ok = real_recv(request, reserved);
-    DWORD code = 0, sz = sizeof code;
-    if (ok && real_query(request, 19 | 0x20000000, NULL, &code, &sz, NULL)) {
-        static int logged;
-        http_status_set(request, (int)code);
-        xlog_sensitive("response handle=%p status=%lu", request, (unsigned long)code);
-        if (code >= 400) {
-            log_sensitive_response_headers(request);
-            capture_sensitive_error_response(request);
-        }
-        if (logged < 40) { logged++; xlog("http status %lu", (unsigned long)code); }
-    } else if (!ok) {
-        xlog("http recv failed %lu", (unsigned long)GetLastError());
-    }
-    return ok;
+    return real_recv(request, reserved);
 }
 static BOOL WINAPI hook_read(void *request, void *buffer, DWORD cap, DWORD *read)
 {
-    BOOL ok = real_read(request, buffer, cap, read);
-    int status = http_status_of(request);
-    if (ok && read && *read && status >= 400) {
-        static int logged;
-        char tmp[180];
-        DWORD n = *read;
-        dump_sensitive_response_chunk(request, buffer, *read);
-        if (n > sizeof tmp - 1) n = sizeof tmp - 1;
-        memcpy(tmp, buffer, n);
-        tmp[n] = 0;
-        for (DWORD i = 0; i < n; i++) if (tmp[i] == '\n' || tmp[i] == '\r') tmp[i] = ' ';
-        if (logged < 8 && !strstr(tmp, "eyJ") && !strstr(tmp, "XBL3")) {
-            logged++;
-            xlog("http error body %s", tmp);
-        }
-    }
-    return ok;
+    return real_read(request, buffer, cap, read);
 }
 
-static void patch_slot(HMODULE mod, unsigned rva, void *hook, void **saved)
+/* Walk XCurl's own import directory and find a WinHTTP import by name, so any
+ * XCurl build works regardless of its IAT layout. Captures the original slot;
+ * redirects it only when a hook is given. */
+static int patch_xcurl_import(HMODULE mod, const char *name, void *hook, void **saved)
 {
-    void **slot = (void **)((unsigned char *)mod + rva);
-    DWORD old;
-    if (!VirtualProtect(slot, sizeof *slot, PAGE_READWRITE, &old)) return;
-    *saved = *slot;
-    *slot = hook;
-    VirtualProtect(slot, sizeof *slot, old, &old);
+    unsigned char *base = (unsigned char *)mod;
+    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)base;
+    PIMAGE_NT_HEADERS nt;
+    PIMAGE_IMPORT_DESCRIPTOR imp;
+    DWORD rva;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+    nt = (PIMAGE_NT_HEADERS)(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
+    rva = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
+    if (!rva) return 0;
+    for (imp = (PIMAGE_IMPORT_DESCRIPTOR)(base + rva); imp->Name; imp++) {
+        PIMAGE_THUNK_DATA orig, iat;
+        if (!imp->OriginalFirstThunk) continue;
+        orig = (PIMAGE_THUNK_DATA)(base + imp->OriginalFirstThunk);
+        iat = (PIMAGE_THUNK_DATA)(base + imp->FirstThunk);
+        for (; orig->u1.AddressOfData; orig++, iat++) {
+            const char *fname;
+            void **slot;
+            DWORD old;
+            if (orig->u1.Ordinal & IMAGE_ORDINAL_FLAG) continue;
+            fname = (const char *)(base + orig->u1.AddressOfData + 2); /* skip WORD hint */
+            if (strcmp(fname, name) != 0) continue;
+            slot = (void **)&iat->u1.Function;
+            if (!VirtualProtect(slot, sizeof *slot, PAGE_READWRITE, &old)) return 0;
+            *saved = *slot;
+            if (hook) *slot = hook;
+            VirtualProtect(slot, sizeof *slot, old, &old);
+            return 1;
+        }
+    }
+    return 0;
 }
+
 static void hook_xcurl_winhttp(void)
 {
+    static const struct { const char *name; void *hook; void **saved; } targets[] = {
+        { "WinHttpSetOption", (void *)hook_set_option, (void **)&real_set_option },
+        { "WinHttpConnect", (void *)hook_connect, (void **)&real_connect },
+        { "WinHttpOpenRequest", (void *)hook_open_request, (void **)&real_open_request },
+        { "WinHttpSendRequest", (void *)hook_send, (void **)&real_send },
+        { "WinHttpAddRequestHeaders", (void *)hook_add_headers, (void **)&real_add_headers },
+        { "WinHttpReceiveResponse", (void *)hook_recv, (void **)&real_recv },
+        { "WinHttpReadData", (void *)hook_read, (void **)&real_read },
+    };
     HMODULE mod;
+    size_t i, count = sizeof targets / sizeof targets[0];
     if (real_set_option) return;
     mod = GetModuleHandleW(L"XCurl.dll");
     if (!mod) return;
-    /* WinHTTP IAT RVAs in Dungeons II's shipped XCurl.dll. */
-    patch_slot(mod, 0x19440, (void *)hook_set_option, (void **)&real_set_option);
-    patch_slot(mod, 0x19428, (void *)hook_connect, (void **)&real_connect);
-    patch_slot(mod, 0x19400, (void *)hook_open_request, (void **)&real_open_request);
-    patch_slot(mod, 0x19430, (void *)hook_send, (void **)&real_send);
-    patch_slot(mod, 0x19448, (void *)hook_add_headers, (void **)&real_add_headers);
-    memcpy(&real_data_available, (unsigned char *)mod + 0x19420, sizeof real_data_available);
-    patch_slot(mod, 0x19410, (void *)hook_recv, (void **)&real_recv);
-    memcpy(&real_query, (unsigned char *)mod + 0x19470, sizeof real_query);
-    patch_slot(mod, 0x19468, (void *)hook_read, (void **)&real_read);
-    xlog("hooked XCurl WinHTTP");
+    for (i = 0; i < count; i++)
+        patch_xcurl_import(mod, targets[i].name, targets[i].hook, targets[i].saved);
 }
 
 static void fill_sec(net_sec_info *out)
@@ -2393,7 +2029,6 @@ static HRESULT WINAPI sec_provider(UINT32 op, const XAsyncProviderData *data)
     if (op == OP_DOWORK) complete_async(data->async, S_OK, sizeof(net_sec_info));
     if (op == OP_GETRESULT && data->buffer && data->bufferSize >= sizeof(net_sec_info)) {
         fill_sec(data->buffer);
-        log_once("security result tls");
     }
     return S_OK;
 }
@@ -2402,7 +2037,7 @@ static HRESULT start_sec_async(XAsyncBlock *async, const char *url)
     async_state *st;
     XAsyncProviderData data;
     HRESULT hr;
-    xlog("security for %s", url ? url : "");
+    (void)url;
     hook_xcurl_winhttp();
     if (!async) return E_INVALIDARG_;
     st = calloc(1, sizeof(*st));
@@ -2410,7 +2045,6 @@ static HRESULT start_sec_async(XAsyncBlock *async, const char *url)
     st->magic = ASYNC_MAGIC;
     st->block = async;
     st->provider = sec_provider;
-    snprintf(st->name, sizeof st->name, "XNetSecurity");
     state_bind(async, st);
     memset(&data, 0, sizeof data);
     data.async = async;
@@ -2439,7 +2073,6 @@ static HRESULT WINAPI net_sec_result(void *self, XAsyncBlock *async, SIZE_T cap,
     if (!buf || cap < sizeof(net_sec_info)) return E_INSUFFICIENT_;
     out = buf;
     fill_sec(out);
-    log_once("security result tls");
     if (info) *(void **)info = out;
     if (used) *used = sizeof(net_sec_info);
     return S_OK;
@@ -2455,7 +2088,6 @@ static HRESULT WINAPI net_sec16_async(void *self, const WCHAR *url, XAsyncBlock 
 static HRESULT WINAPI net_verify(void *self, void *req, const void *info)
 {
     (void)self; (void)req; (void)info;
-    log_once("verify cert");
     return S_OK;
 }
 static void fill_hint(unsigned char *p)
@@ -2469,7 +2101,6 @@ static void fill_hint(unsigned char *p)
 static HRESULT WINAPI net_hint(void *self, void *hint)
 {
     (void)self;
-    log_once("XNetworkingGetConnectivityHint");
     if (!hint) return E_POINTER_;
     fill_hint(hint);
     return S_OK;
@@ -2487,7 +2118,6 @@ static HRESULT WINAPI net_reg_hint(void *self, void *q, void *ctx, void *cb, UIN
     (void)self;
     g_net_cb = cb;
     g_net_ctx = ctx;
-    log_once("reg connectivity");
     if (token) *token = 1;
     if (cb) thr_Submit(NULL, (queue_obj *)q, PORT_COMP, NULL, deliver_net);
     return S_OK;
@@ -2499,16 +2129,14 @@ static BOOLEAN WINAPI net_unreg_hint(void *self, UINT64 token, BOOLEAN wait)
 }
 static HRESULT WINAPI net_get_cfg(void *self, UINT32 setting, UINT64 *value)
 {
-    (void)self;
-    xlog("net cfg %lu", (unsigned long)setting);
+    (void)self; (void)setting;
     if (!value) return E_POINTER_;
     *value = 4ull << 20;
     return S_OK;
 }
 static HRESULT WINAPI net_set_cfg(void *self, UINT32 setting, UINT64 value)
 {
-    (void)self;
-    xlog("net set cfg %lu %llu", (unsigned long)setting, (unsigned long long)value);
+    (void)self; (void)setting; (void)value;
     return S_OK;
 }
 static HRESULT WINAPI net_stats(void *self, UINT32 type, void *buf)
@@ -2586,16 +2214,12 @@ static int known_and_qi(const GUID *id, const GUID *iid, void **out)
 
 __declspec(dllexport) HRESULT WINAPI InitializeApiImplEx2(UINT64 gdk, UINT64 gs, UINT32 mode, const void *options)
 {
-    char exe[260];
+    (void)gdk; (void)gs; (void)mode; (void)options;
     if (!g_inited) {
         g_inited = 1;
         fix_vtbls();
         process_queue();
-        GetModuleFileNameA(NULL, exe, sizeof(exe));
-        xlog("init gdk=%llx gs=%llx mode=%lu exe=%s",
-             (unsigned long long)gdk, (unsigned long long)gs, (unsigned long)mode, exe);
     }
-    (void)options;
     return S_OK;
 }
 
@@ -2611,24 +2235,18 @@ __declspec(dllexport) HRESULT WINAPI InitializeApiImpl(UINT64 gdk, UINT64 gs)
 
 __declspec(dllexport) HRESULT WINAPI UninitializeApiImpl(void)
 {
-    log_once("uninit");
     return S_OK;
 }
 
 __declspec(dllexport) HRESULT WINAPI XErrorReport(HRESULT hr, const char *msg)
 {
-    xlog("XErrorReport %08lX %s", (unsigned long)hr, msg ? msg : "");
     if (g_err_cb) g_err_cb(hr, msg, g_err_ctx);
     return S_OK;
 }
 
-static GUID g_unknown[48];
-static int g_unknown_n;
-static int g_unknown_total;
-
 __declspec(dllexport) HRESULT WINAPI QueryApiImpl(const GUID *clsid, const GUID *iid, void **out)
 {
-    int i, rc;
+    int rc;
     if (!out) return E_POINTER_;
     *out = NULL;
     if (!clsid) return E_INVALIDARG_;
@@ -2639,23 +2257,14 @@ __declspec(dllexport) HRESULT WINAPI QueryApiImpl(const GUID *clsid, const GUID 
         rc = known_and_qi(iid, iid, out);
         if (rc != 1) return rc;
     }
-    g_unknown_total++;
-    for (i = 0; i < g_unknown_n; i++) {
-        if (guid_eq(&g_unknown[i], clsid)) return E_NOINTERFACE_;
-    }
-    if (g_unknown_n < (int)(sizeof(g_unknown) / sizeof(g_unknown[0])))
-        g_unknown[g_unknown_n++] = *clsid;
-    log_guid("unknown", clsid);
-    if (iid && !guid_eq(iid, clsid)) log_guid(" unknown-iid", iid);
-    if ((g_unknown_total % 500) == 0)
-        xlog("unknown total %d", g_unknown_total);
     return E_NOINTERFACE_;
 }
 
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, void *reserved)
 {
-    (void)inst; (void)reserved;
+    (void)reserved;
     if (reason == DLL_PROCESS_ATTACH) {
+        g_module = inst;
         g_tls = TlsAlloc();
         InitializeCriticalSection(&g_lock);
         g_lock_ready = 1;

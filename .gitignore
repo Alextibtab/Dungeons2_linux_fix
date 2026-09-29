@@ -6,4 +6,8 @@ login-error.txt
 __pycache__/
 *.pyc
 .venv/
+.temp/
+build/
+dist/
+*.egg-info/
 src/test_xgr.exe
