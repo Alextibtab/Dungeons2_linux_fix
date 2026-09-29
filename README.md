@@ -1,29 +1,26 @@
 # Minecraft Dungeons II on Linux
 
-A local stand-in for Microsoft Gaming Services so Minecraft Dungeons II (Steam app `1912410`) can start under Proton. The game looks for `xgameruntime.dll`. This repository builds that DLL. It does not modify the game and it does not include Microsoft's library.
+A local stand-in for Microsoft Gaming Services so Minecraft Dungeons II (Steam app `1912410`) can start under Proton. The game loads `xgameruntime.dll`; this repository builds it. It does not modify the game or ship Microsoft's library.
 
-On first launch it signs you in with your own Microsoft account through the normal device-code page at <https://www.microsoft.com/link>, then caches the Xbox tokens next to the helper. Later launches reuse that cache until it expires.
+Sign-in is a manual step: run `xauth.py` once with your own Microsoft account, and it caches the Xbox tokens next to the helper. The DLL only reads that cache at launch — there is no in-game sign-in window.
 
 ## Install
 
-Proton and Python 3 are required. Clone this repository into the directory the DLL searches and run the installer:
+Proton and Python 3 are required, including its `venv` module (on Debian/Ubuntu install `python3-venv`). Quit the game before installing.
 
 ```sh
 git clone https://github.com/Alextibtab/Dungeons2_linux_fix.git ~/.local/share/dungeons2-compat
 cd ~/.local/share/dungeons2-compat
-chmod +x install.sh
 ./install.sh
 ```
 
-`install.sh` creates a Python virtual environment in `.venv` and installs the third-party [`cryptography`](https://pypi.org/project/cryptography/) package into it; the device-token step needs that package. The DLL runs `xauth.py` with the environment's interpreter and falls back to `/usr/bin/python3` when `.venv` is absent. Creating a venv needs Python's `venv` module — on Debian/Ubuntu install `python3-venv` first (`sudo apt install python3-venv`).
+`install.sh`:
 
-`install.sh` copies `src/xgameruntime.dll` to three places:
+- creates `.venv` and installs the dependencies from `pyproject.toml` (`cryptography`, for the device-token step);
+- copies `xgameruntime.dll` next to `Dungeons.exe`, next to `Dungeons-Win64-Shipping.exe`, and into the Proton prefix `drive_c/windows/system32`;
+- downloads the matching `XCurl.dll` into the game's `Win64` folder.
 
-- next to `Dungeons.exe`
-- next to `Dungeons-Win64-Shipping.exe`
-- into the Proton prefix `drive_c/windows/system32`
-
-If the game lives in another Steam library, the script reads `libraryfolders.vdf`. Point `STEAM_ROOT` at your Steam install if it is not `~/.local/share/Steam`.
+It finds the game through Steam's `libraryfolders.vdf`; set `STEAM_ROOT` if Steam is not in `~/.local/share/Steam`.
 
 In Steam, open the game's properties and set the launch option:
 
@@ -31,25 +28,25 @@ In Steam, open the game's properties and set the launch option:
 WINEDLLOVERRIDES="xgameruntime=n" %command%
 ```
 
-Quit the game completely before installing. A running process keeps the old DLL.
+On the Compatibility tab, set the game to use **Proton Experimental** or **Proton-GE**. The DLL supplies the Gaming Services pieces, so no special Proton build is required.
 
-## First sign-in
+## Sign in
 
-Start the game from Steam. A window shows a code and opens <https://www.microsoft.com/link>. Enter the code, then sign in with the Microsoft account that should own the Xbox profile. Leave that page as `https://www.microsoft.com/link` with no extra query string.
+From the clone directory:
 
-The token file is `~/.local/share/dungeons2-compat/tokens.txt` (mode `0600`). Do not share it. When it expires, the next launch refreshes it or asks you to sign in again.
+```sh
+.venv/bin/python3 xauth.py
+```
 
-The cache holds three Xbox tokens, one per relying party: `http://xboxlive.com` for the general Xbox services, `rp://api.minecraftservices.com/` for Minecraft, and `http://playfab.xboxlive.com/` for PlayFab. The PlayFab token is minted with a proof-of-possession device token, which PlayFab requires; without it the account-link step fails.
+A window shows a code and opens <https://www.microsoft.com/link> (the URL and code are also printed in the terminal). Enter the code and sign in with the Microsoft account that owns the Xbox profile, then leave the page on that URL. Re-run after the login expires.
+
+Use `--force` to sign in again, `--status` to show the cached login, or `--logout` to delete it. The cache is `tokens.txt` next to `xauth.py` (mode `0600`); `install.sh` records that location for the DLL, so the helper works from any directory. Do not share the file.
 
 ## Rebuild
 
-The DLL already in `src/` is ready to install. To build it yourself you need a MinGW-w64 posix cross compiler:
+The bundled `src/xgameruntime.dll` is built against the exact `XCurl.dll` that `install.sh` downloads (Microsoft GDK PC 230307, `10.0.22621.3139`); rebuild it if you use a different `XCurl.dll`. Needs a MinGW-w64 posix cross compiler:
 
 ```sh
 x86_64-w64-mingw32-gcc-posix -shared -O2 -Wall -Wextra -o src/xgameruntime.dll src/xgameruntime.c
 ./install.sh
 ```
-
-## What the game gets
-
-The DLL answers the Gaming Services calls this title makes: task queues, a signed-in Xbox user (your real XUID and gamertag from the cache), title id, retail sandbox, persistent local storage, and the HTTPS security settings XCurl asks for before it connects. PlayFab login still uses the Steam session. The Microsoft token is returned only when the game asks for one, and the DLL picks the token that matches the requested service: the Minecraft token for `api.minecraftservices.com`, the PlayFab token for `playfabapi.com`, and the general Xbox token for everything else such as `*.xboxlive.com`.

@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dungeons2-compat"
+version = "1.0.0"
+description = "Microsoft account sign-in helper for Minecraft Dungeons II on Linux"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "cryptography",
+]
+
+[tool.setuptools]
+py-modules = ["xauth"]
