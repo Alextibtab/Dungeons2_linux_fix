@@ -1,11 +1,17 @@
 #!/bin/sh
 # Copy xgameruntime.dll next to both game executables and into the Proton prefix.
+# Also runs xauth.py at the end to generate the login token, unless --no-login
+# is passed or stdin is not a terminal.
 set -eu
 ROOT=$(CDPATH= cd -- "$(dirname "$0")" && pwd -P)
 TEMP="$ROOT/.temp"
+LOGIN=1
+for arg in "$@"; do
+    case "$arg" in
+        --no-login) LOGIN=0 ;;
+    esac
+done
 
-STEAM_ROOT=${STEAM_ROOT:-$HOME/.local/share/Steam}
-VDF="$STEAM_ROOT/steamapps/libraryfolders.vdf"
 DLL="$ROOT/src/xgameruntime.dll"
 GDK_NUPKG_FILE="$TEMP/gdk.nupkg"
 APPID=1912410
@@ -13,6 +19,42 @@ APPID=1912410
 PY=${PYTHON:-/usr/bin/python3}
 VENV="$ROOT/.venv"
 XAUTH="$ROOT/xauth.py"
+
+# Locate the Steam installation (the directory that contains steamapps). When
+# STEAM_ROOT is set we use exactly that path and fail loudly if it is wrong,
+# rather than silently falling back to a default and confusing the user.
+resolve_steam_root() {
+    if [ -n "${STEAM_ROOT:-}" ]; then
+        root=${STEAM_ROOT%/}
+        case $root in
+            "~") root=$HOME ;;
+            "~/"*) root=$HOME/${root#\~/} ;;
+        esac
+        if [ ! -f "$root/steamapps/libraryfolders.vdf" ]; then
+            echo "STEAM_ROOT is set to '$STEAM_ROOT', but" >&2
+            echo "  $root/steamapps/libraryfolders.vdf" >&2
+            echo "does not exist. Point STEAM_ROOT at the Steam install folder" >&2
+            echo "(the one containing 'steamapps'), or unset it to autodetect." >&2
+            exit 1
+        fi
+        STEAM_ROOT=$root
+        return
+    fi
+    for root in "$HOME/.local/share/Steam" "$HOME/.steam/steam" "$HOME/.steam/root"; do
+        if [ -f "$root/steamapps/libraryfolders.vdf" ]; then
+            STEAM_ROOT=$root
+            return
+        fi
+    done
+    echo "Could not find steamapps/libraryfolders.vdf. Looked in:" >&2
+    for root in "$HOME/.local/share/Steam" "$HOME/.steam/steam" "$HOME/.steam/root"; do
+        echo "  $root/steamapps/libraryfolders.vdf" >&2
+    done
+    echo "Set STEAM_ROOT to the Steam install folder (the one containing 'steamapps')." >&2
+    exit 1
+}
+resolve_steam_root
+VDF="$STEAM_ROOT/steamapps/libraryfolders.vdf"
 
 LIB=$(awk '
     /"path"/ {
@@ -68,14 +110,6 @@ EOF
     exit 1
 fi
 
-if [ ! -f "$STEAM_ROOT/steamapps/libraryfolders.vdf" ] && [ -f "$HOME/.steam/steam/steamapps/libraryfolders.vdf" ]; then
-    STEAM_ROOT=$HOME/.steam/steam
-fi
-if [ ! -f "$VDF" ]; then
-    echo "Could not find libraryfolders.vdf. Set STEAM_ROOT." >&2
-    exit 1
-fi
-
 if [ -z "$LIB" ]; then
     echo "Steam app $APPID is not in any library folder." >&2
     exit 1
@@ -108,14 +142,26 @@ echo "Installed $SHIP/XCurl.dll"
 
 chmod +x "$XAUTH"
 echo ""
-echo "============================================================"
-echo "Setup complete. NEXT STEP: generate your login token first!"
-echo ""
-echo "Before launching the game, run xauth.py once to sign in with"
-echo "your Microsoft account and generate your login token:"
-echo "  $VENV/bin/python3 $XAUTH   # or: ./xauth.py"
-echo "============================================================"
-echo ""
+
+if [ "$LOGIN" -eq 1 ] && [ -t 0 ]; then
+    echo "============================================================"
+    echo "Signing in to your Microsoft account (generates your login token)."
+    echo "============================================================"
+    if ! "$VENV/bin/python3" "$XAUTH"; then
+        echo "Sign-in did not complete. Re-run it any time with:" >&2
+        echo "  $VENV/bin/python3 $XAUTH" >&2
+    fi
+else
+    echo "============================================================"
+    echo "Setup complete. NEXT STEP: generate your login token first!"
+    echo ""
+    echo "Before launching the game, run xauth.py once to sign in with"
+    echo "your Microsoft account and generate your login token:"
+    echo "  $VENV/bin/python3 $XAUTH   # or: ./xauth.py"
+    echo "============================================================"
+    echo ""
+fi
+
 echo "Then set this launch option for Minecraft Dungeons II in Steam:"
 echo 'WINEDLLOVERRIDES="xgameruntime=n" %command%'
 echo "and set its Compatibility tool to Proton Experimental or Proton-GE."
