@@ -20,7 +20,7 @@ cd ~/.local/share/dungeons2-compat
 - copies `xgameruntime.dll` next to `Dungeons.exe`, next to `Dungeons-Win64-Shipping.exe`, and into the Proton prefix `drive_c/windows/system32`;
 - downloads the matching `XCurl.dll` into the game's `Win64` folder.
 
-It finds the game through Steam's `libraryfolders.vdf`; set `STEAM_ROOT` if Steam is not in `~/.local/share/Steam`.
+It finds the game through Steam's `libraryfolders.vdf`; set `STEAM_ROOT` to Steam's install directory (the one containing `steamapps`) if Steam is not in `~/.local/share/Steam`. Make sure to `export` it, and note that it must point at the Steam *install* folder, not at a secondary game library.
 
 In Steam, open the game's properties and set the launch option:
 
